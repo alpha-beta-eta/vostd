@@ -1,0 +1,227 @@
+# ensures-coverage for vostd (README.md, "在CI中运行").  Copy this file to
+# vostd's .github/workflows/.
+#
+# For the functions a change involves (contrib/pr-functions.rkt), reports
+# the outputs their postconditions never mention.  Advisory only: it never
+# blocks a PR.  When the fixture test fails (tests/run.sh; the VIR format of
+# the current Verus is not what the tool expects) or `check` warns, it stops
+# without a report: on pull requests it says so in the job summary and
+# succeeds; on pushes to main it fails, so that the tool gets fixed.
+#
+# The tool comes from tools/ensures-coverage when vostd has it there, and
+# otherwise from EC_REPOSITORY at EC_REF (a private repository needs the
+# secret ENSURES_COVERAGE_TOKEN, a token that can read it).
+name: ensures-coverage
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Commit to diff against (default HEAD~1)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  EC_REPOSITORY: alpha-beta-eta/ensures-coverage
+  EC_REF: main
+  RACKET_VERSION: '9.3'
+  RUST_TARGET: x86_64-unknown-none
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ensures-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # push: the pushed commit; pull_request: the merge commit.
+          ref: ${{ github.sha }}
+          submodules: recursive
+          # the base commit is needed for `git diff`
+          fetch-depth: 0
+
+      - name: Resolve the base commit
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request) BASE='${{ github.event.pull_request.base.sha }}' ;;
+            push) BASE='${{ github.event.before }}' ;;
+            *) BASE='${{ inputs.base }}' ;;
+          esac
+          # a new branch has no `before`
+          if [[ -z "$BASE" || "$BASE" =~ ^0+$ ]]; then BASE=HEAD~1; fi
+          BASE=$(git rev-parse --verify "$BASE^{commit}")
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          echo "Diffing against $BASE"
+
+      - name: Set up toolchain and caches
+        id: setup
+        uses: ./.github/actions/setup-verus
+        with:
+          dv-cache: restore
+
+      - name: Checkout ensures-coverage
+        if: hashFiles('tools/ensures-coverage/main.rkt') == ''
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.EC_REPOSITORY }}
+          ref: ${{ env.EC_REF }}
+          path: .ensures-coverage
+          token: ${{ secrets.ENSURES_COVERAGE_TOKEN || github.token }}
+
+      - name: Locate ensures-coverage
+        run: |
+          if [[ -f tools/ensures-coverage/main.rkt ]]; then
+            EC="$GITHUB_WORKSPACE/tools/ensures-coverage"
+            EC_COMMIT="tools/ensures-coverage in this repository"
+          else
+            EC="$GITHUB_WORKSPACE/.ensures-coverage"
+            EC_COMMIT="$EC_REPOSITORY@$(git -C "$EC" rev-parse HEAD)"
+          fi
+          echo "EC=$EC" >> "$GITHUB_ENV"
+          echo "EC_COMMIT=$EC_COMMIT" >> "$GITHUB_ENV"
+          echo "OUT=$RUNNER_TEMP/ensures-coverage" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ensures-coverage"
+
+      - name: Cache Racket
+        id: racket-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/racket
+          key: ${{ runner.os }}-racket-minimal-${{ env.RACKET_VERSION }}
+
+      - name: Install Racket
+        run: |
+          if [[ ! -x ~/racket/bin/racket ]]; then
+            curl -fsSLo "$RUNNER_TEMP/racket.sh" \
+              "https://download.racket-lang.org/installers/$RACKET_VERSION/racket-minimal-$RACKET_VERSION-x86_64-linux-cs.sh"
+            sh "$RUNNER_TEMP/racket.sh" --in-place --dest ~/racket </dev/null
+          fi
+          echo "$HOME/racket/bin" >> "$GITHUB_PATH"
+          ~/racket/bin/racket --version
+
+      - name: Cache item-index
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.EC }}/item-index/target
+          key: ${{ runner.os }}-item-index-${{ steps.setup.outputs.verus-commit }}-${{ hashFiles(format('{0}/item-index/**/*.rs', env.EC), format('{0}/item-index/Cargo.toml', env.EC)) }}
+
+      - name: Build item-index against the vendored verus_syn
+        run: |
+          # README.md, 准备: without `cargo update` the pinned crates.io version wins
+          P="patch.crates-io.verus_syn.path=\"$GITHUB_WORKSPACE/tools/verus/dependencies/syn\""
+          cd "$EC/item-index"
+          cargo update -p verus_syn --config "$P"
+          cargo build --release --config "$P"
+          echo "ITEM_INDEX=$EC/item-index/target/release/item-index" >> "$GITHUB_ENV"
+
+      - name: Fixture test
+        id: fixture
+        run: |
+          set +e
+          VERUS="$GITHUB_WORKSPACE/tools/verus/source/target-verus/release/verus" \
+          VERUS_Z3_PATH="$GITHUB_WORKSPACE/tools/verus/source/z3" \
+            "$EC/tests/run.sh" > "$OUT/fixture.txt" 2>&1
+          status=$?
+          cat "$OUT/fixture.txt"
+          if [[ $status -eq 0 ]]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "STOP=the fixture test failed: the VIR of this Verus is not what ensures-coverage expects" >> "$GITHUB_ENV"
+          fi
+
+      - name: Export VIR
+        if: steps.fixture.outputs.ok == 'true'
+        run: |
+          set -o pipefail
+          cargo dv focus --package ostd --target "$RUST_TARGET" -- \
+            --no-verify --log vir --log-dir "$OUT/vir" 2>&1 | tail -n 20
+          # cargo-verus writes nothing when it hits its cache (README.md, 运行)
+          test -s "$OUT/vir/crate.vir" || { echo "no crate.vir was written"; exit 1; }
+          ls -la "$OUT/vir/crate.vir"
+
+      - name: Check
+        id: check
+        if: steps.fixture.outputs.ok == 'true'
+        run: |
+          racket "$EC/main.rkt" check "$OUT/vir/crate.vir" "$OUT/head.results" "$GITHUB_WORKSPACE" "$ITEM_INDEX" \
+            2> "$OUT/check.err" | tee "$OUT/check.out"
+          cat "$OUT/check.err"
+          if [[ -s "$OUT/check.err" ]]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "STOP=check printed warnings, so its results cannot be trusted" >> "$GITHUB_ENV"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Select the functions the change involves and report
+        if: steps.check.outputs.ok == 'true'
+        run: |
+          racket "$EC/contrib/pr-functions.rkt" "$OUT/head.results" "$GITHUB_WORKSPACE" "$BASE" "$OUT/pr.results" \
+            | tee "$OUT/select.out"
+          racket "$EC/main.rkt" report "$OUT/pr.results" "$OUT/pr.md" all
+          racket "$EC/main.rkt" report "$OUT/head.results" "$OUT/all.md" all
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "# ensures-coverage"
+            echo
+            echo "Advisory only: an output the postcondition never mentions is a signal, not necessarily a defect (see the tool's README)."
+            echo
+            echo "- Changes: \`${BASE:-?}\`..\`$(git rev-parse HEAD)\`, target \`$RUST_TARGET\`, crate \`ostd\`"
+            echo "- Verus: \`$("$GITHUB_WORKSPACE/tools/verus/source/target-verus/release/verus" --version 2>/dev/null | sed -n 's/^ *Version: //p')\`, ensures-coverage: \`${EC_COMMIT:-?}\`"
+            if [[ -n "${STOP:-}" ]]; then
+              echo
+              echo "**Stopped: $STOP.** No report for this run."
+            elif [[ -f "$OUT/pr.md" ]]; then
+              echo "- $(cat "$OUT/check.out" | head -n 1)"
+              echo "- $(cat "$OUT/select.out" | tr '\n' ' ')"
+              echo
+              # GITHUB_STEP_SUMMARY takes at most 1 MiB
+              head -c 800000 "$OUT/pr.md"
+            else
+              echo
+              echo "**ensures-coverage did not finish; see the log.**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ensures-coverage
+          path: |
+            ${{ env.OUT }}/*.results
+            ${{ env.OUT }}/*.md
+            ${{ env.OUT }}/*.out
+            ${{ env.OUT }}/*.err
+            ${{ env.OUT }}/fixture.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Fail on main when the tool had to stop
+        if: env.STOP != '' && github.event_name == 'push'
+        run: |
+          echo "ensures-coverage stopped on main: $STOP"
+          exit 1

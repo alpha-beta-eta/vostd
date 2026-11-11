@@ -1,0 +1,19 @@
+[package]
+name = "item-index"
+version = "0.1.0"
+edition = "2021"
+
+# verus_syn must parse the syntax of the Verus that the checked project uses.
+# Cargo.lock pins the crates.io version that vostd 36e90fe19 vendors in
+# tools/verus/dependencies/syn.  To build against a project's own copy
+# instead (offline, another Verus version, CI):
+#   cargo build --release --config 'patch.crates-io.verus_syn.path="<$SRC>/tools/verus/dependencies/syn"'
+# The requirement is a lower bound, not `=`: a patch is used only when its
+# version meets the requirement, and otherwise cargo ignores it with just a
+# warning ("patch ... was not used") and silently builds the pinned version.
+[dependencies]
+verus_syn = { version = ">=0.0.0-2026-09-06-0133", features = ["full", "parsing", "printing"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+
+[workspace]
