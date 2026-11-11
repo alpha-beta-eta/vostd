@@ -1,4 +1,0 @@
-# tests/run.sh must keep LF to run under bash, also from a Windows checkout,
-# and tests/run.sh compares its LF output with expected.results byte by byte
-*.sh text eol=lf
-*.results text eol=lf
